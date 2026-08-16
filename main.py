@@ -3,7 +3,7 @@ import base64
 import io
 import time
 from datetime import datetime
-from groq import Groq
+from openai import OpenAI
 import streamlit as st
 
 try:
@@ -12,23 +12,22 @@ try:
 except ImportError:
     PDF_SUPPORT = False
 
-GROQ_API_KEY = st.secrets.get("GROQ_API_KEY")
-if not GROQ_API_KEY:
-    st.error("GROQ_API_KEY not found in st.secrets. Add it to .streamlit/secrets.toml (locally) or your app's Secrets settings (on Streamlit Cloud).")
+SAMBANOVA_API_KEY = st.secrets.get("SAMBANOVA_API_KEY")
+if not SAMBANOVA_API_KEY:
+    st.error("SAMBANOVA_API_KEY not found in st.secrets. Add it to .streamlit/secrets.toml (locally) or your app's Secrets settings (on Streamlit Cloud).")
     st.stop()
 
-client = Groq(api_key=GROQ_API_KEY)
+client = OpenAI(api_key=SAMBANOVA_API_KEY, base_url="https://api.sambanova.ai/v1")
 
-TEXT_MODEL   = "llama-3.3-70b-versatile"
-VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+TEXT_MODEL   = "Meta-Llama-3.3-70B-Instruct"
+VISION_MODEL = "Llama-4-Maverick-17B-128E-Instruct"
 
 AVAILABLE_MODELS = {
-    "llama-3.3-70b-versatile":                   "LLaMA 3.3 70B (Default)",
-    "llama3-8b-8192":                            "LLaMA 3 8B (Fast)",
-    "llama3-70b-8192":                           "LLaMA 3 70B",
-    "mixtral-8x7b-32768":                        "Mixtral 8x7B",
-    "gemma2-9b-it":                              "Gemma 2 9B",
-    "meta-llama/llama-4-scout-17b-16e-instruct": "LLaMA 4 Scout (Vision)",
+    "Meta-Llama-3.3-70B-Instruct":         "LLaMA 3.3 70B (Default)",
+    "Meta-Llama-3.1-8B-Instruct":          "LLaMA 3.1 8B (Fast)",
+    "Meta-Llama-3.1-405B-Instruct":        "LLaMA 3.1 405B",
+    "Llama-4-Scout-17B-16E-Instruct":      "LLaMA 4 Scout (Vision)",
+    "Llama-4-Maverick-17B-128E-Instruct":  "LLaMA 4 Maverick (Vision)",
 }
 
 DEFAULT_SYSTEM_PROMPT = (
@@ -39,7 +38,7 @@ DEFAULT_SYSTEM_PROMPT = (
 )
 
 # ── Page config ───────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Groq AI Chatbot", page_icon="🤖", layout="wide")
+st.set_page_config(page_title="SambaNova AI Chatbot", page_icon="🤖", layout="wide")
 
 st.markdown("""
 <style>
@@ -160,7 +159,7 @@ def all_sessions():
 # ════════════════════════════════════════════════════════════
 with st.sidebar:
     st.image("https://cdn-icons-png.flaticon.com/512/4712/4712039.png", width=80)
-    st.title("Groq AI Chatbot 🤖")
+    st.title("SambaNova AI Chatbot 🤖")
     st.markdown("---")
 
     # ── Sessions ─────────────────────────────────────────────
@@ -396,11 +395,13 @@ if user_input:
     completion_tokens = 0
 
     with st.spinner(""):
-        # Stream WITHOUT stream_options (not supported by Groq SDK)
+        # SambaNova's OpenAI-compatible API returns usage in a final chunk
+        # when stream_options={"include_usage": True} is set
         stream = client.chat.completions.create(
             messages=base_messages,
             model=chosen_model,
             stream=True,
+            stream_options={"include_usage": True},
         )
 
         for chunk in stream:
@@ -412,9 +413,9 @@ if user_input:
                     unsafe_allow_html=True,
                 )
 
-            # Groq returns usage in the final chunk via x_groq field
-            if hasattr(chunk, "x_groq") and chunk.x_groq and hasattr(chunk.x_groq, "usage"):
-                usage             = chunk.x_groq.usage
+            # Final chunk carries usage stats (choices is empty on this chunk)
+            if getattr(chunk, "usage", None):
+                usage             = chunk.usage
                 prompt_tokens     = getattr(usage, "prompt_tokens",     0) or 0
                 completion_tokens = getattr(usage, "completion_tokens", 0) or 0
 
