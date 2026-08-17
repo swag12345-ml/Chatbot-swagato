@@ -3,7 +3,7 @@ import base64
 import io
 import time
 from datetime import datetime
-from openai import OpenAI
+from openai import OpenAI, RateLimitError, APIError
 import streamlit as st
 
 try:
@@ -19,6 +19,40 @@ if not SAMBANOVA_API_KEY:
 
 client = OpenAI(api_key=SAMBANOVA_API_KEY, base_url="https://api.sambanova.ai/v1")
 
+
+def get_stream_with_fallback(messages, primary_model, is_vision=False):
+    """
+    Try the requested model first. If SambaNova returns a 429 (high demand),
+    move down the fallback chain until one model accepts the request.
+    Returns (stream, model_actually_used).
+    Raises the last error if every candidate in the chain is rate-limited.
+    """
+    chain = VISION_FALLBACK_CHAIN if is_vision else TEXT_FALLBACK_CHAIN
+    candidates = [primary_model] + [m for m in chain if m != primary_model]
+
+    last_error = None
+    for model in candidates:
+        try:
+            stream = client.chat.completions.create(
+                messages=messages,
+                model=model,
+                stream=True,
+                stream_options={"include_usage": True},
+            )
+            return stream, model
+        except RateLimitError as e:
+            last_error = e
+            continue
+        except APIError as e:
+            # Non-rate-limit API errors (bad request, etc.) shouldn't be
+            # silently retried against a different model — surface them.
+            if getattr(e, "status_code", None) == 429:
+                last_error = e
+                continue
+            raise
+
+    raise last_error
+
 TEXT_MODEL   = "Meta-Llama-3.3-70B-Instruct"
 VISION_MODEL = "Llama-4-Maverick-17B-128E-Instruct"
 
@@ -29,6 +63,17 @@ AVAILABLE_MODELS = {
     "Llama-4-Scout-17B-16E-Instruct":      "LLaMA 4 Scout (Vision)",
     "Llama-4-Maverick-17B-128E-Instruct":  "LLaMA 4 Maverick (Vision)",
 }
+
+# Order matters: tried left-to-right until one responds without a 429.
+TEXT_FALLBACK_CHAIN = [
+    "Meta-Llama-3.3-70B-Instruct",
+    "Meta-Llama-3.1-8B-Instruct",
+    "Meta-Llama-3.1-405B-Instruct",
+]
+VISION_FALLBACK_CHAIN = [
+    "Llama-4-Maverick-17B-128E-Instruct",
+    "Llama-4-Scout-17B-16E-Instruct",
+]
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are an advanced AI assistant (LLM). "
@@ -396,28 +441,46 @@ if user_input:
 
     with st.spinner(""):
         # SambaNova's OpenAI-compatible API returns usage in a final chunk
-        # when stream_options={"include_usage": True} is set
-        stream = client.chat.completions.create(
-            messages=base_messages,
-            model=chosen_model,
-            stream=True,
-            stream_options={"include_usage": True},
-        )
+        # when stream_options={"include_usage": True} is set.
+        # get_stream_with_fallback retries with alternate models on a 429.
+        try:
+            stream, model_used = get_stream_with_fallback(
+                base_messages, chosen_model, is_vision=has_image
+            )
+        except RateLimitError:
+            st.error(
+                "🚦 All available models are currently experiencing high demand "
+                "on SambaNova's side. Please wait a moment and try again."
+            )
+            st.stop()
 
-        for chunk in stream:
-            # Accumulate streamed text
-            if chunk.choices and chunk.choices[0].delta.content:
-                full_reply += chunk.choices[0].delta.content
-                reply_placeholder.markdown(
-                    f"<div class='bot-bubble'><div class='role-label'>Assistant</div>{full_reply}▌</div>",
-                    unsafe_allow_html=True,
-                )
+        if model_used != chosen_model:
+            st.info(
+                f"⚠️ **{AVAILABLE_MODELS.get(chosen_model, chosen_model)}** is "
+                f"currently overloaded — this reply was generated with "
+                f"**{AVAILABLE_MODELS.get(model_used, model_used)}** instead."
+            )
 
-            # Final chunk carries usage stats (choices is empty on this chunk)
-            if getattr(chunk, "usage", None):
-                usage             = chunk.usage
-                prompt_tokens     = getattr(usage, "prompt_tokens",     0) or 0
-                completion_tokens = getattr(usage, "completion_tokens", 0) or 0
+        try:
+            for chunk in stream:
+                # Accumulate streamed text
+                if chunk.choices and chunk.choices[0].delta.content:
+                    full_reply += chunk.choices[0].delta.content
+                    reply_placeholder.markdown(
+                        f"<div class='bot-bubble'><div class='role-label'>Assistant</div>{full_reply}▌</div>",
+                        unsafe_allow_html=True,
+                    )
+
+                # Final chunk carries usage stats (choices is empty on this chunk)
+                if getattr(chunk, "usage", None):
+                    usage             = chunk.usage
+                    prompt_tokens     = getattr(usage, "prompt_tokens",     0) or 0
+                    completion_tokens = getattr(usage, "completion_tokens", 0) or 0
+        except RateLimitError:
+            st.warning(
+                "🚦 Hit a rate limit mid-response. Partial reply shown below — "
+                "try sending your message again."
+            )
 
     total_msg_tokens = prompt_tokens + completion_tokens
 
