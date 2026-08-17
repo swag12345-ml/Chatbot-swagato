@@ -22,10 +22,11 @@ client = OpenAI(api_key=SAMBANOVA_API_KEY, base_url="https://api.sambanova.ai/v1
 
 def get_stream_with_fallback(messages, primary_model, is_vision=False):
     """
-    Try the requested model first. If SambaNova returns a 429 (high demand),
-    move down the fallback chain until one model accepts the request.
+    Try the requested model first. If SambaNova returns a 429 (high demand)
+    or the model has been removed/renamed on their end, move down the
+    fallback chain until one model accepts the request.
     Returns (stream, model_actually_used).
-    Raises the last error if every candidate in the chain is rate-limited.
+    Raises the last error if every candidate in the chain fails.
     """
     chain = VISION_FALLBACK_CHAIN if is_vision else TEXT_FALLBACK_CHAIN
     candidates = [primary_model] + [m for m in chain if m != primary_model]
@@ -44,9 +45,11 @@ def get_stream_with_fallback(messages, primary_model, is_vision=False):
             last_error = e
             continue
         except APIError as e:
-            # Non-rate-limit API errors (bad request, etc.) shouldn't be
-            # silently retried against a different model — surface them.
-            if getattr(e, "status_code", None) == 429:
+            # Covers both 429s that surface as a generic APIError and
+            # "model not available" errors when SambaNova retires a model.
+            # Either way, moving to the next candidate is the right move.
+            status = getattr(e, "status_code", None)
+            if status == 429 or status == 404 or "not available" in str(e).lower():
                 last_error = e
                 continue
             raise
@@ -54,25 +57,33 @@ def get_stream_with_fallback(messages, primary_model, is_vision=False):
     raise last_error
 
 TEXT_MODEL   = "Meta-Llama-3.3-70B-Instruct"
-VISION_MODEL = "Llama-4-Maverick-17B-128E-Instruct"
+VISION_MODEL = "gemma-4-31B-it"
 
+# Matches SambaNova Cloud's current catalog (docs.sambanova.ai/docs/en/models/sambacloud-models).
+# Their lineup changes without much notice — deprecated/removed model IDs
+# raise APIStatusError "model not available" rather than a 429, so keep this
+# list in sync with the docs periodically.
 AVAILABLE_MODELS = {
-    "Meta-Llama-3.3-70B-Instruct":         "LLaMA 3.3 70B (Default)",
-    "Meta-Llama-3.1-8B-Instruct":          "LLaMA 3.1 8B (Fast)",
-    "Meta-Llama-3.1-405B-Instruct":        "LLaMA 3.1 405B",
-    "Llama-4-Scout-17B-16E-Instruct":      "LLaMA 4 Scout (Vision)",
-    "Llama-4-Maverick-17B-128E-Instruct":  "LLaMA 4 Maverick (Vision)",
+    "Meta-Llama-3.3-70B-Instruct": "LLaMA 3.3 70B (Default)",
+    "DeepSeek-V3.1":               "DeepSeek V3.1",
+    "gpt-oss-120b":                "GPT-OSS 120B",
+    "MiniMax-M2.7":                "MiniMax M2.7",
+    "gemma-4-31B-it":              "Gemma 4 31B (Vision, Preview)",
+    "DeepSeek-V3.2":               "DeepSeek V3.2 (Preview)",
 }
 
 # Order matters: tried left-to-right until one responds without a 429.
+# Only includes model IDs currently live on SambaNova Cloud — see AVAILABLE_MODELS comment.
 TEXT_FALLBACK_CHAIN = [
     "Meta-Llama-3.3-70B-Instruct",
-    "Meta-Llama-3.1-8B-Instruct",
-    "Meta-Llama-3.1-405B-Instruct",
+    "DeepSeek-V3.1",
+    "gpt-oss-120b",
+    "MiniMax-M2.7",
 ]
 VISION_FALLBACK_CHAIN = [
-    "Llama-4-Maverick-17B-128E-Instruct",
-    "Llama-4-Scout-17B-16E-Instruct",
+    "gemma-4-31B-it",
+    # No second vision-capable model currently offered on SambaNova Cloud.
+    # If they add one, list it here.
 ]
 
 DEFAULT_SYSTEM_PROMPT = (
@@ -447,17 +458,20 @@ if user_input:
             stream, model_used = get_stream_with_fallback(
                 base_messages, chosen_model, is_vision=has_image
             )
-        except RateLimitError:
+        except (RateLimitError, APIError):
             st.error(
-                "🚦 All available models are currently experiencing high demand "
-                "on SambaNova's side. Please wait a moment and try again."
+                "🚦 None of the configured models could be reached right now — "
+                "they may all be busy, or SambaNova may have changed their "
+                "model lineup. Check AVAILABLE_MODELS against "
+                "https://docs.sambanova.ai/docs/en/models/sambacloud-models "
+                "and try again."
             )
             st.stop()
 
         if model_used != chosen_model:
             st.info(
-                f"⚠️ **{AVAILABLE_MODELS.get(chosen_model, chosen_model)}** is "
-                f"currently overloaded — this reply was generated with "
+                f"⚠️ **{AVAILABLE_MODELS.get(chosen_model, chosen_model)}** wasn't "
+                f"available (busy or retired) — this reply was generated with "
                 f"**{AVAILABLE_MODELS.get(model_used, model_used)}** instead."
             )
 
