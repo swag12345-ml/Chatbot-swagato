@@ -3,8 +3,7 @@ import base64
 import io
 import time
 from datetime import datetime
-from dotenv import load_dotenv
-from groq import Groq
+from openai import OpenAI, RateLimitError, APIError
 import streamlit as st
 
 try:
@@ -13,20 +12,37 @@ try:
 except ImportError:
     PDF_SUPPORT = False
 
-load_dotenv()
-client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+SAMBANOVA_API_KEY = st.secrets.get("SAMBANOVA_API_KEY")
+if not SAMBANOVA_API_KEY:
+    st.error("SAMBANOVA_API_KEY not found in st.secrets. Add it to .streamlit/secrets.toml (locally) or your app's Secrets settings (on Streamlit Cloud).")
+    st.stop()
 
-TEXT_MODEL   = "llama-3.3-70b-versatile"
-VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+client = OpenAI(api_key=SAMBANOVA_API_KEY, base_url="https://api.sambanova.ai/v1")
 
-AVAILABLE_MODELS = {
-    "llama-3.3-70b-versatile":                   "LLaMA 3.3 70B (Default)",
-    "llama3-8b-8192":                            "LLaMA 3 8B (Fast)",
-    "llama3-70b-8192":                           "LLaMA 3 70B",
-    "mixtral-8x7b-32768":                        "Mixtral 8x7B",
-    "gemma2-9b-it":                              "Gemma 2 9B",
-    "meta-llama/llama-4-scout-17b-16e-instruct": "LLaMA 4 Scout (Vision)",
-}
+
+def get_stream(messages, max_retries=2):
+    """
+    Call SambaNova with Meta-Llama-3.3-70B-Instruct.
+    Retries a couple of times on 429 (brief backoff) before giving up —
+    there's no other model to fall back to.
+    """
+    last_error = None
+    for attempt in range(max_retries + 1):
+        try:
+            return client.chat.completions.create(
+                messages=messages,
+                model=TEXT_MODEL,
+                stream=True,
+                stream_options={"include_usage": True},
+            )
+        except RateLimitError as e:
+            last_error = e
+            if attempt < max_retries:
+                time.sleep(2 * (attempt + 1))  # 2s, then 4s
+            continue
+    raise last_error
+
+TEXT_MODEL = "Meta-Llama-3.3-70B-Instruct"
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are an advanced AI assistant (LLM). "
@@ -36,7 +52,7 @@ DEFAULT_SYSTEM_PROMPT = (
 )
 
 # ── Page config ───────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Groq AI Chatbot", page_icon="🤖", layout="wide")
+st.set_page_config(page_title="SambaNova AI Chatbot", page_icon="🤖", layout="wide")
 
 st.markdown("""
 <style>
@@ -141,9 +157,6 @@ if "sessions" not in st.session_state:
 if "system_prompt" not in st.session_state:
     st.session_state.system_prompt = DEFAULT_SYSTEM_PROMPT
 
-if "selected_model" not in st.session_state:
-    st.session_state.selected_model = TEXT_MODEL
-
 
 def active():
     return st.session_state.sessions[st.session_state.active_session]
@@ -157,7 +170,7 @@ def all_sessions():
 # ════════════════════════════════════════════════════════════
 with st.sidebar:
     st.image("https://cdn-icons-png.flaticon.com/512/4712/4712039.png", width=80)
-    st.title("Groq AI Chatbot 🤖")
+    st.title("SambaNova AI Chatbot 🤖")
     st.markdown("---")
 
     # ── Sessions ─────────────────────────────────────────────
@@ -196,14 +209,10 @@ with st.sidebar:
 
     st.markdown("---")
 
-    # ── Model selector ────────────────────────────────────────
+    # ── Model ──────────────────────────────────────────────────
     st.markdown("### 🧠 Model")
-    st.session_state.selected_model = st.selectbox(
-        "Choose model:",
-        options=list(AVAILABLE_MODELS.keys()),
-        format_func=lambda k: AVAILABLE_MODELS[k],
-        index=list(AVAILABLE_MODELS.keys()).index(st.session_state.selected_model),
-    )
+    st.markdown(f"**{TEXT_MODEL}**")
+    st.caption("Text-only. Images can be uploaded but won't be analyzed.")
 
     st.markdown("---")
 
@@ -279,7 +288,7 @@ history   = active()["history"]
 
 st.title(f"💬 {active()['name']}")
 st.caption(
-    f"Model: **{AVAILABLE_MODELS[st.session_state.selected_model]}**  |  "
+    f"Model: **{TEXT_MODEL}**  |  "
     f"Memory: {'✅ On' if memory_enabled else '❌ Off'}"
 )
 
@@ -345,31 +354,20 @@ user_input = st.chat_input(
 #  HANDLE SUBMISSION WITH STREAMING
 # ════════════════════════════════════════════════════════════
 if user_input:
-    chosen_model = st.session_state.selected_model
-    sys_prompt   = st.session_state.system_prompt
+    sys_prompt = st.session_state.system_prompt
 
     # ── Build user content ────────────────────────────────────
+    # Meta-Llama-3.3-70B-Instruct is text-only, so an uploaded image is
+    # never sent to the API — just flagged to the user.
     if has_image:
-        user_content = [
-            {
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:{st.session_state['image_mime']};base64,{st.session_state['image_b64']}"
-                },
-            },
-            {"type": "text", "text": user_input},
-        ]
-        if has_pdf:
-            user_content.append({
-                "type": "text",
-                "text": f"\n\n[PDF context]:\n{st.session_state['pdf_text'][:6000]}",
-            })
-        chosen_model = VISION_MODEL
+        st.warning(
+            "🖼️ An image is attached, but this model (Llama 3.3 70B) is "
+            "text-only and can't see it — it'll be ignored for this reply."
+        )
 
-    elif has_pdf:
+    if has_pdf:
         pdf_ctx      = f"\n\n[PDF — '{st.session_state['pdf_name']}']:\n{st.session_state['pdf_text'][:8000]}"
         user_content = user_input + pdf_ctx
-
     else:
         user_content = user_input
 
@@ -393,27 +391,59 @@ if user_input:
     completion_tokens = 0
 
     with st.spinner(""):
-        # Stream WITHOUT stream_options (not supported by Groq SDK)
-        stream = client.chat.completions.create(
-            messages=base_messages,
-            model=chosen_model,
-            stream=True,
-        )
+        # SambaNova's OpenAI-compatible API returns usage in a final chunk
+        # when stream_options={"include_usage": True} is set.
+        # get_stream retries a couple of times on 429 before giving up.
+        try:
+            stream = get_stream(base_messages)
+        except (RateLimitError, APIError):
+            st.error(
+                "🚦 Meta-Llama-3.3-70B-Instruct is rate-limited or unavailable "
+                "on SambaNova right now. Please wait a moment and try again."
+            )
+            st.stop()
 
-        for chunk in stream:
-            # Accumulate streamed text
-            if chunk.choices and chunk.choices[0].delta.content:
-                full_reply += chunk.choices[0].delta.content
-                reply_placeholder.markdown(
-                    f"<div class='bot-bubble'><div class='role-label'>Assistant</div>{full_reply}▌</div>",
-                    unsafe_allow_html=True,
-                )
+        try:
+            for chunk in stream:
+                # Accumulate streamed text
+                if chunk.choices and chunk.choices[0].delta.content:
+                    full_reply += chunk.choices[0].delta.content
+                    reply_placeholder.markdown(
+                        f"<div class='bot-bubble'><div class='role-label'>Assistant</div>{full_reply}▌</div>",
+                        unsafe_allow_html=True,
+                    )
 
-            # Groq returns usage in the final chunk via x_groq field
-            if hasattr(chunk, "x_groq") and chunk.x_groq and hasattr(chunk.x_groq, "usage"):
-                usage             = chunk.x_groq.usage
-                prompt_tokens     = getattr(usage, "prompt_tokens",     0) or 0
-                completion_tokens = getattr(usage, "completion_tokens", 0) or 0
+                # Final chunk carries usage stats (choices is empty on this chunk)
+                if getattr(chunk, "usage", None):
+                    usage             = chunk.usage
+                    prompt_tokens     = getattr(usage, "prompt_tokens",     0) or 0
+                    completion_tokens = getattr(usage, "completion_tokens", 0) or 0
+        except RateLimitError:
+            st.warning(
+                "🚦 Hit a rate limit mid-response. Partial reply shown below — "
+                "try sending your message again."
+            )
+
+        try:
+            for chunk in stream:
+                # Accumulate streamed text
+                if chunk.choices and chunk.choices[0].delta.content:
+                    full_reply += chunk.choices[0].delta.content
+                    reply_placeholder.markdown(
+                        f"<div class='bot-bubble'><div class='role-label'>Assistant</div>{full_reply}▌</div>",
+                        unsafe_allow_html=True,
+                    )
+
+                # Final chunk carries usage stats (choices is empty on this chunk)
+                if getattr(chunk, "usage", None):
+                    usage             = chunk.usage
+                    prompt_tokens     = getattr(usage, "prompt_tokens",     0) or 0
+                    completion_tokens = getattr(usage, "completion_tokens", 0) or 0
+        except RateLimitError:
+            st.warning(
+                "🚦 Hit a rate limit mid-response. Partial reply shown below — "
+                "try sending your message again."
+            )
 
     total_msg_tokens = prompt_tokens + completion_tokens
 
