@@ -3,7 +3,8 @@ import base64
 import io
 import time
 from datetime import datetime
-from openai import OpenAI, RateLimitError, APIError
+from dotenv import load_dotenv
+from groq import Groq
 import streamlit as st
 
 try:
@@ -12,79 +13,20 @@ try:
 except ImportError:
     PDF_SUPPORT = False
 
-SAMBANOVA_API_KEY = st.secrets.get("SAMBANOVA_API_KEY")
-if not SAMBANOVA_API_KEY:
-    st.error("SAMBANOVA_API_KEY not found in st.secrets. Add it to .streamlit/secrets.toml (locally) or your app's Secrets settings (on Streamlit Cloud).")
-    st.stop()
+load_dotenv()
+client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
-client = OpenAI(api_key=SAMBANOVA_API_KEY, base_url="https://api.sambanova.ai/v1")
+TEXT_MODEL   = "llama-3.3-70b-versatile"
+VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 
-
-def get_stream_with_fallback(messages, primary_model, is_vision=False):
-    """
-    Try the requested model first. If SambaNova returns a 429 (high demand)
-    or the model has been removed/renamed on their end, move down the
-    fallback chain until one model accepts the request.
-    Returns (stream, model_actually_used).
-    Raises the last error if every candidate in the chain fails.
-    """
-    chain = VISION_FALLBACK_CHAIN if is_vision else TEXT_FALLBACK_CHAIN
-    candidates = [primary_model] + [m for m in chain if m != primary_model]
-
-    last_error = None
-    for model in candidates:
-        try:
-            stream = client.chat.completions.create(
-                messages=messages,
-                model=model,
-                stream=True,
-                stream_options={"include_usage": True},
-            )
-            return stream, model
-        except RateLimitError as e:
-            last_error = e
-            continue
-        except APIError as e:
-            # Covers both 429s that surface as a generic APIError and
-            # "model not available" errors when SambaNova retires a model.
-            # Either way, moving to the next candidate is the right move.
-            status = getattr(e, "status_code", None)
-            if status == 429 or status == 404 or "not available" in str(e).lower():
-                last_error = e
-                continue
-            raise
-
-    raise last_error
-
-TEXT_MODEL   = "Meta-Llama-3.3-70B-Instruct"
-VISION_MODEL = "gemma-4-31B-it"
-
-# Matches SambaNova Cloud's current catalog (docs.sambanova.ai/docs/en/models/sambacloud-models).
-# Their lineup changes without much notice — deprecated/removed model IDs
-# raise APIStatusError "model not available" rather than a 429, so keep this
-# list in sync with the docs periodically.
 AVAILABLE_MODELS = {
-    "Meta-Llama-3.3-70B-Instruct": "LLaMA 3.3 70B (Default)",
-    "DeepSeek-V3.1":               "DeepSeek V3.1",
-    "gpt-oss-120b":                "GPT-OSS 120B",
-    "MiniMax-M2.7":                "MiniMax M2.7",
-    "gemma-4-31B-it":              "Gemma 4 31B (Vision, Preview)",
-    "DeepSeek-V3.2":               "DeepSeek V3.2 (Preview)",
+    "llama-3.3-70b-versatile":                   "LLaMA 3.3 70B (Default)",
+    "llama3-8b-8192":                            "LLaMA 3 8B (Fast)",
+    "llama3-70b-8192":                           "LLaMA 3 70B",
+    "mixtral-8x7b-32768":                        "Mixtral 8x7B",
+    "gemma2-9b-it":                              "Gemma 2 9B",
+    "meta-llama/llama-4-scout-17b-16e-instruct": "LLaMA 4 Scout (Vision)",
 }
-
-# Order matters: tried left-to-right until one responds without a 429.
-# Only includes model IDs currently live on SambaNova Cloud — see AVAILABLE_MODELS comment.
-TEXT_FALLBACK_CHAIN = [
-    "Meta-Llama-3.3-70B-Instruct",
-    "DeepSeek-V3.1",
-    "gpt-oss-120b",
-    "MiniMax-M2.7",
-]
-VISION_FALLBACK_CHAIN = [
-    "gemma-4-31B-it",
-    # No second vision-capable model currently offered on SambaNova Cloud.
-    # If they add one, list it here.
-]
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are an advanced AI assistant (LLM). "
@@ -94,7 +36,7 @@ DEFAULT_SYSTEM_PROMPT = (
 )
 
 # ── Page config ───────────────────────────────────────────────────────────────
-st.set_page_config(page_title="SambaNova AI Chatbot", page_icon="🤖", layout="wide")
+st.set_page_config(page_title="Groq AI Chatbot", page_icon="🤖", layout="wide")
 
 st.markdown("""
 <style>
@@ -215,7 +157,7 @@ def all_sessions():
 # ════════════════════════════════════════════════════════════
 with st.sidebar:
     st.image("https://cdn-icons-png.flaticon.com/512/4712/4712039.png", width=80)
-    st.title("SambaNova AI Chatbot 🤖")
+    st.title("Groq AI Chatbot 🤖")
     st.markdown("---")
 
     # ── Sessions ─────────────────────────────────────────────
@@ -451,50 +393,27 @@ if user_input:
     completion_tokens = 0
 
     with st.spinner(""):
-        # SambaNova's OpenAI-compatible API returns usage in a final chunk
-        # when stream_options={"include_usage": True} is set.
-        # get_stream_with_fallback retries with alternate models on a 429.
-        try:
-            stream, model_used = get_stream_with_fallback(
-                base_messages, chosen_model, is_vision=has_image
-            )
-        except (RateLimitError, APIError):
-            st.error(
-                "🚦 None of the configured models could be reached right now — "
-                "they may all be busy, or SambaNova may have changed their "
-                "model lineup. Check AVAILABLE_MODELS against "
-                "https://docs.sambanova.ai/docs/en/models/sambacloud-models "
-                "and try again."
-            )
-            st.stop()
+        # Stream WITHOUT stream_options (not supported by Groq SDK)
+        stream = client.chat.completions.create(
+            messages=base_messages,
+            model=chosen_model,
+            stream=True,
+        )
 
-        if model_used != chosen_model:
-            st.info(
-                f"⚠️ **{AVAILABLE_MODELS.get(chosen_model, chosen_model)}** wasn't "
-                f"available (busy or retired) — this reply was generated with "
-                f"**{AVAILABLE_MODELS.get(model_used, model_used)}** instead."
-            )
+        for chunk in stream:
+            # Accumulate streamed text
+            if chunk.choices and chunk.choices[0].delta.content:
+                full_reply += chunk.choices[0].delta.content
+                reply_placeholder.markdown(
+                    f"<div class='bot-bubble'><div class='role-label'>Assistant</div>{full_reply}▌</div>",
+                    unsafe_allow_html=True,
+                )
 
-        try:
-            for chunk in stream:
-                # Accumulate streamed text
-                if chunk.choices and chunk.choices[0].delta.content:
-                    full_reply += chunk.choices[0].delta.content
-                    reply_placeholder.markdown(
-                        f"<div class='bot-bubble'><div class='role-label'>Assistant</div>{full_reply}▌</div>",
-                        unsafe_allow_html=True,
-                    )
-
-                # Final chunk carries usage stats (choices is empty on this chunk)
-                if getattr(chunk, "usage", None):
-                    usage             = chunk.usage
-                    prompt_tokens     = getattr(usage, "prompt_tokens",     0) or 0
-                    completion_tokens = getattr(usage, "completion_tokens", 0) or 0
-        except RateLimitError:
-            st.warning(
-                "🚦 Hit a rate limit mid-response. Partial reply shown below — "
-                "try sending your message again."
-            )
+            # Groq returns usage in the final chunk via x_groq field
+            if hasattr(chunk, "x_groq") and chunk.x_groq and hasattr(chunk.x_groq, "usage"):
+                usage             = chunk.x_groq.usage
+                prompt_tokens     = getattr(usage, "prompt_tokens",     0) or 0
+                completion_tokens = getattr(usage, "completion_tokens", 0) or 0
 
     total_msg_tokens = prompt_tokens + completion_tokens
 
