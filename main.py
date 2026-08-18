@@ -22,7 +22,7 @@ client = OpenAI(api_key=SAMBANOVA_API_KEY, base_url="https://api.sambanova.ai/v1
 
 def get_stream(messages, max_retries=2):
     """
-    Call SambaNova with Meta-Llama-3.3-70B-Instruct.
+    Call SambaNova with the model in TEXT_MODEL.
     Retries a couple of times on 429 (brief backoff) before giving up —
     there's no other model to fall back to.
     """
@@ -42,7 +42,7 @@ def get_stream(messages, max_retries=2):
             continue
     raise last_error
 
-TEXT_MODEL = "Meta-Llama-3.3-70B-Instruct"
+TEXT_MODEL = "gpt-oss-120b"
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are an advanced AI assistant (LLM). "
@@ -357,12 +357,12 @@ if user_input:
     sys_prompt = st.session_state.system_prompt
 
     # ── Build user content ────────────────────────────────────
-    # Meta-Llama-3.3-70B-Instruct is text-only, so an uploaded image is
-    # never sent to the API — just flagged to the user.
+    # TEXT_MODEL is text-only, so an uploaded image is never sent to the
+    # API — just flagged to the user.
     if has_image:
         st.warning(
-            "🖼️ An image is attached, but this model (Llama 3.3 70B) is "
-            "text-only and can't see it — it'll be ignored for this reply."
+            f"🖼️ An image is attached, but this model ({TEXT_MODEL}) is "
+            f"text-only and can't see it — it'll be ignored for this reply."
         )
 
     if has_pdf:
@@ -396,11 +396,15 @@ if user_input:
         # get_stream retries a couple of times on 429 before giving up.
         try:
             stream = get_stream(base_messages)
-        except (RateLimitError, APIError):
+        except (RateLimitError, APIError) as e:
+            status = getattr(e, "status_code", "unknown")
             st.error(
-                "🚦 Meta-Llama-3.3-70B-Instruct is rate-limited or unavailable "
-                "on SambaNova right now. Please wait a moment and try again."
+                f"🚦 Request to {TEXT_MODEL} failed "
+                f"(status: {status}). This is either a real rate limit, "
+                f"or something else SambaNova rejected."
             )
+            with st.expander("Show technical details"):
+                st.code(str(e))
             st.stop()
 
         try:
